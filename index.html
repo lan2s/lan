@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Simple Bandwidth Speed Test</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin: 24px; }
+    h1 { margin-bottom: 8px; }
+    label { display:block; margin: 12px 0 6px; }
+    input[type="text"] { width: 100%; padding: 8px; box-sizing: border-box; }
+    button { margin-top: 12px; padding: 10px 14px; }
+    .meter { height: 18px; background:#eee; border-radius:9px; overflow:hidden; margin-top:12px; }
+    .meter > span { display:block; height:100%; background:linear-gradient(90deg,#4caf50,#2196f3); width:0%; transition: width 0.2s; }
+    .stats { margin-top:12px; }
+    .small { color:#666; font-size:0.9rem; }
+    pre { background:#f7f7f7; padding:12px; border-radius:6px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <h1>Simple Bandwidth Speed Test</h1>
+
+  <label for="url">Test file URL (must allow CORS):</label>
+  <input id="url" type="text" value="https://speed.hetzner.de/100MB.bin" />
+
+  <label for="duration">Max test duration (seconds):</label>
+  <input id="duration" type="number" min="1" value="10" />
+
+  <button id="start">Start Download Test</button>
+  <button id="stop" disabled>Stop</button>
+
+  <div class="meter" aria-hidden><span id="bar"></span></div>
+
+  <div class="stats">
+    <div><strong>Downloaded:</strong> <span id="downloaded">0 B</span></div>
+    <div><strong>Elapsed:</strong> <span id="elapsed">0.0 s</span></div>
+    <div><strong>Average:</strong> <span id="average">0.00 Mbps</span></div>
+    <div><strong>Instant:</strong> <span id="instant">0.00 Mbps</span></div>
+    <div class="small">Note: Results vary based on network, server, and CORS availability.</div>
+  </div>
+
+  <script>
+    const startBtn = document.getElementById('start');
+    const stopBtn = document.getElementById('stop');
+    const urlInput = document.getElementById('url');
+    const durationInput = document.getElementById('duration');
+    const bar = document.getElementById('bar');
+    const downloadedEl = document.getElementById('downloaded');
+    const elapsedEl = document.getElementById('elapsed');
+    const avgEl = document.getElementById('average');
+    const instEl = document.getElementById('instant');
+
+    let controller = null;
+    let reader = null;
+    let running = false;
+
+    function formatBytes(bytes) {
+      if (bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B','KB','MB','GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return (bytes / Math.pow(k, i)).toFixed(2) + ' ' + sizes[i];
+    }
+
+    function bpsToMbps(bitsPerSec) {
+      return (bitsPerSec / 1_000_000).toFixed(2);
+    }
+
+    startBtn.addEventListener('click', async () => {
+      const url = urlInput.value.trim();
+      const maxDuration = Math.max(1, Number(durationInput.value) || 10) * 1000;
+
+      if (!url) {
+        alert('Please enter a test file URL.');
+        return;
+      }
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      bar.style.width = '0%';
+      downloadedEl.textContent = '0 B';
+      elapsedEl.textContent = '0.0 s';
+      avgEl.textContent = '0.00 Mbps';
+      instEl.textContent = '0.00 Mbps';
+
+      controller = new AbortController();
+      running = true;
+
+      try {
+        const resp = await fetch(url, { signal: controller.signal });
+        if (!resp.ok || !resp.body) {
+          throw new Error('Failed to fetch test file or streaming not supported (CORS?). Status: ' + resp.status);
+        }
+
+        const contentLength = resp.headers.get('content-length');
+        const totalBytesHint = contentLength ? Number(contentLength) : null;
+        const startTime = performance.now();
+        let lastTime = startTime;
+        let bytes = 0;
+        let lastBytes = 0;
+
+        reader = resp.body.getReader();
+
+        // Stop after maxDuration or when stream ends
+        const stopAt = startTime + maxDuration;
+
+        while (running) {
+          const now = performance.now();
+          if (now >= stopAt) break;
+
+          const { done, value } = await Promise.race([
+            reader.read(),
+            new Promise(resolve => setTimeout(() => resolve({ timeout: true }), 1000))
+          ]);
+
+          if (value && value.timeout) {
+            // just update UI while waiting
+          } else if (done) {
+            break;
+          } else if (value) {
+            bytes += value.byteLength;
+            const elapsed = (now - startTime) / 1000;
+            const interval = (now - lastTime) / 1000 || 0.001;
+            const intervalBytes = bytes - lastBytes;
+            const instantBps = (intervalBytes * 8) / interval;
+            const avgBps = (bytes * 8) / Math.max(elapsed, 0.001);
+
+            // update UI
+            downloadedEl.textContent = formatBytes(bytes);
+            elapsedEl.textContent = elapsed.toFixed(2) + ' s';
+            avgEl.textContent = bpsToMbps(avgBps) + ' Mbps';
+            instEl.textContent = bpsToMbps(instantBps) + ' Mbps';
+
+            // progress if we know file size
+            if (totalBytesHint) {
+              const pct = Math.min(100, (bytes / totalBytesHint) * 100);
+              bar.style.width = pct.toFixed(2) + '%';
+            } else {
+              // animate progress if unknown
+              const pct = Math.min(100, (elapsed / (maxDuration/1000)) * 100);
+              bar.style.width = pct.toFixed(2) + '%';
+            }
+
+            lastTime = now;
+            lastBytes = bytes;
+          }
+        }
+
+        const totalElapsed = (performance.now() - startTime) / 1000;
+        const finalAvgBps = (bytes * 8) / Math.max(totalElapsed, 0.001);
+        avgEl.textContent = bpsToMbps(finalAvgBps) + ' Mbps';
+        elapsedEl.textContent = totalElapsed.toFixed(2) + ' s';
+
+      } catch (err) {
+        alert('Error during test: ' + err.message);
+      } finally {
+        running = false;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        if (reader) {
+          try { reader.cancel(); } catch (e) {}
+          reader = null;
+        }
+        if (controller) {
+          try { controller.abort(); } catch (e) {}
+          controller = null;
+        }
+      }
+    });
+
+    stopBtn.addEventListener('click', () => {
+      running = false;
+      if (controller) controller.abort();
+      stopBtn.disabled = true;
+    });
+  </script>
+</body>
+</html>
